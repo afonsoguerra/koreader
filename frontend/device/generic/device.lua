@@ -89,6 +89,8 @@ local Device = {
     hasBattery = yes,
     hasAuxBattery = no,
     hasKeyboard = no,
+    supportsExternalKeyboard = no,
+    hasOTGManagement = no,
     hasKeys = no,
     hasScreenKB = no, -- in practice only some Kindles
     hasSymKey = no, -- in practice only some Kindles
@@ -145,6 +147,9 @@ local Device = {
     startTextInput = function() end,
     stopTextInput = function() end,
 
+    getOTGRole = function() end,
+    setOTGRole = function(role) end,
+
     -- use these only as a last resort. We should abstract the functionality
     -- and have device dependent implementations in the corresponding
     -- device/<devicetype>/device.lua file
@@ -155,6 +160,7 @@ local Device = {
     isKobo = no,
     isPocketBook = no,
     isRemarkable = no,
+    isBookeen = no,
     isSDL = no,
     isEmulator = no,
     isDesktop = no,

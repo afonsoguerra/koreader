@@ -63,10 +63,7 @@ end
 function FileManagerMenu:onPhysicalKeyboardConnected()
     self.key_events = {}
     self:registerKeyEvents()
-    if self.menu_container then
-        self:onCloseFileManagerMenu()
-    end
-    self.tab_item_table = nil
+    self:onRebuildMenu()
 end
 FileManagerMenu.onPhysicalKeyboardDisconnected = FileManagerMenu.onPhysicalKeyboardConnected
 
@@ -456,6 +453,20 @@ To:
         end,
         callback = function()
             G_reader_settings:flipNilOrFalse("reverse_collate")
+            FileChooser:refreshPath()
+        end,
+    }
+    self.menu_items.sort_ignore_articles = {
+        text = _("Ignore leading articles"),
+        enabled_func = function()
+            return FileChooser:getCollate().compares_names ~= false
+        end,
+        checked_func = function()
+            return FileChooser:getCollate().compares_names ~= false and G_reader_settings:isTrue("sort_ignore_articles")
+        end,
+        callback = function()
+            G_reader_settings:flipNilOrFalse("sort_ignore_articles")
+            BookList.updateSortTextFunc()
             FileChooser:refreshPath()
         end,
     }
@@ -1056,6 +1067,31 @@ function FileManagerMenu:onCloseFileManagerMenu()
     UIManager:close(self.menu_container)
     self.menu_container = nil
     return true
+end
+
+function FileManagerMenu:teardownMenu()
+    if self.menu_container then
+        self:onCloseFileManagerMenu()
+    end
+    self.tab_item_table = nil
+end
+
+function FileManagerMenu:onRebuildMenu()
+    local was_open = self.menu_container ~= nil
+    local state
+    if was_open and self.menu_container[1] then
+        state = self.menu_container[1]:getState()
+    end
+    self:teardownMenu()
+
+    if was_open then
+        self:onShowMenu(nil, true)
+        local menu = self.menu_container[1]
+        if state and menu.restoreState then
+            menu:restoreState(state.path_stack, state.page)
+        end
+        UIManager:show(self.menu_container)
+    end
 end
 
 function FileManagerMenu:_getTabIndexFromLocation(ges)

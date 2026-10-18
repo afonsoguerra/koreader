@@ -189,6 +189,16 @@ function OPDSBrowser:showCatalogMenu()
             align = "left",
         }})
     end
+    if self.alt_search_url then
+        table.insert(buttons, {{
+            text = "\u{f002} " .. _("Alt search"),
+            callback = function()
+                UIManager:close(dialog)
+                self:searchCatalog(self.alt_search_url)
+            end,
+            align = "left",
+        }})
+    end
     if self.facet_groups then
         table.insert(buttons, {}) -- separator
         for group_name, links in ffiUtil.orderedPairs(self.facet_groups) do
@@ -451,7 +461,7 @@ end
 -- Fetches feed from server
 function OPDSBrowser:fetchFeed(item_url, headers_only, extra_headers)
     local sink = {}
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
+    local block_timeout, total_timeout = socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
     local request = {
         url      = item_url,
         method   = headers_only and "HEAD" or "GET",
@@ -497,9 +507,13 @@ function OPDSBrowser:fetchFeed(item_url, headers_only, extra_headers)
             ["403"] = _("Failed to authenticate. Please check your username and password."),
             ["404"] = _("Catalog not found."),
             ["406"] = _("Cannot get catalog. Server refuses to serve uncompressed content."),
-            [socketutil.SSL_HANDSHAKE_CODE] = _("Cannot get catalog. TLS connection interrupted."),
         }
-        text = code and error_message[tostring(code)] or T(_("Cannot get catalog. Server response status: %1."), status or code)
+        local network_error = socketutil.describe_error(code, block_timeout, total_timeout)
+        if network_error then
+            text = _("Cannot get catalog.") .. "\n\n" .. network_error
+        else
+            text = code and error_message[tostring(code)] or T(_("Cannot get catalog. Server response status: %1."), status or code)
+        end
     end
     UIManager:show(InfoMessage:new{
         text = text,
@@ -616,6 +630,7 @@ function OPDSBrowser:genItemTableFromCatalog2(catalog, item_url)
     self.catalog_title = catalog.metadata and catalog.metadata.title or self.catalog_title
     self.facet_groups = nil
     self.search_url = nil
+    self.alt_search_url = nil
     local item_table = { hrefs = {} }
 
     if type(catalog.links) == "table" then
@@ -808,21 +823,21 @@ end
 -- Generates catalog item table and processes OPDS facets/search links
 function OPDSBrowser:genItemTableFromCatalog(catalog, item_url)
     local item_table = {}
-    self.facet_groups = nil -- Reset facets
-    self.search_url = nil   -- Reset search URL
+    self.facet_groups = nil
+    self.search_url = nil
+    self.alt_search_url = nil
 
     if not catalog then
         return item_table
     end
 
     local feed = catalog.feed or catalog
-    self.facet_groups = {} -- Initialize table to store facet groups
+    self.facet_groups = {}
 
     local function build_href(href)
         return url.absolute(item_url, href)
     end
 
-    local has_opensearch = false
     local hrefs = {}
     if feed.link then
         for __, link in ipairs(feed.link) do
@@ -833,17 +848,14 @@ function OPDSBrowser:genItemTableFromCatalog(catalog, item_url)
                     end
                 end
                 if not self.sync then
-                    -- OpenSearch
-                    if link.type:find(self.search_type) then
-                        if link.href then
-                            self.search_url = build_href(self:getSearchTemplate(build_href(link.href)))
-                            has_opensearch = true
+                    if link.href then
+                        if not self.search_url and link.type:find(self.search_type) then
+                            local template = self:getSearchTemplate(build_href(link.href))
+                            self.search_url = template and build_href(template)
                         end
-                    end
-                    -- Calibre search (also matches the actual template for OpenSearch!)
-                    if link.type:find(self.search_template_type) and link.rel and link.rel:find("search") then
-                        if link.href and not has_opensearch then
-                            self.search_url = build_href(link.href:gsub("{searchTerms}", "%%s"))
+                        if not self.alt_search_url and link.type:find(self.search_template_type)
+                                and link.rel and link.rel:find("search") then
+                            self.alt_search_url = build_href(link.href:gsub("{searchTerms}", "%%s"))
                         end
                     end
                     -- Process OPDS facets
@@ -855,6 +867,14 @@ function OPDSBrowser:genItemTableFromCatalog(catalog, item_url)
                         table.insert(self.facet_groups[group_name], link)
                     end
                 end
+            end
+        end
+        if self.alt_search_url then
+            if not self.search_url then
+                self.search_url = self.alt_search_url
+                self.alt_search_url = nil
+            elseif self.alt_search_url == self.search_url then
+                self.alt_search_url = nil
             end
         end
     end
@@ -998,6 +1018,7 @@ function OPDSBrowser:saveCatalogSnapshot()
             facet_groups = self.facet_groups,
             item_table = self.item_table,
             search_url = self.search_url,
+            alt_search_url = self.alt_search_url,
         }
     end
 end
@@ -1340,10 +1361,10 @@ end
 
 function OPDSBrowser:downloadFile(local_path, remote_url, username, password, caller_callback)
     logger.dbg("Downloading file", local_path, "from", remote_url)
-    local code, headers, status
+    local code, headers, status, block_timeout, total_timeout
     local parsed = url.parse(remote_url)
     if parsed.scheme == "http" or parsed.scheme == "https" then
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+        block_timeout, total_timeout = socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
         code, headers, status = self:getHttpClient():request {
             url      = remote_url,
             headers  = {
@@ -1373,12 +1394,14 @@ function OPDSBrowser:downloadFile(local_path, remote_url, username, password, ca
         })
     else
         util.removeFile(local_path)
-        logger.dbg("OPDSBrowser:downloadFile: Request failed:", status or code)
+        logger.warn("OPDSBrowser:downloadFile: Request failed:", remote_url, status or code,
+                    "block_timeout:", block_timeout, "total_timeout:", total_timeout)
         logger.dbg("OPDSBrowser:downloadFile: Response headers:", headers)
         UIManager:show(InfoMessage:new {
             text = T(_("Could not save file to:\n%1\n%2"),
                 BD.filepath(local_path),
-                status or code or "network unreachable"),
+                socketutil.describe_error(code, block_timeout, total_timeout)
+                    or status or code or _("Network unreachable.")),
         })
     end
 end
@@ -1494,6 +1517,7 @@ function OPDSBrowser:onReturn()
             self.catalog_title = path.snapshot.catalog_title
             self.facet_groups = path.snapshot.facet_groups
             self.search_url = path.snapshot.search_url
+            self.alt_search_url = path.snapshot.alt_search_url
             self:setCatalogMenu(path.url, path.snapshot.item_table)
         else
             -- Return to a path that predates session caching.
@@ -2206,4 +2230,5 @@ function OPDSBrowser:downloadPendingSyncs()
         UIManager:show(textviewer)
     end
 end
+
 return OPDSBrowser
