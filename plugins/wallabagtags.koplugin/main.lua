@@ -744,6 +744,139 @@ function WallabagTags:debugReconcile(touchmenu_instance)
     })
 end
 
+-- next/previous file within a collection
+
+-- The collection the current book was opened from, so that "Open next file" can
+-- walk that collection instead of the folder. Follows the chain as files open.
+local coll_context = { file = nil, coll = nil }
+
+-- Files of a collection, in the order the collection view shows them
+-- (mirrors FileManagerCollection:setCollate and :updateItemTable).
+local function getCollectionFiles(coll_name, ui)
+    local coll = ReadCollection.coll[coll_name]
+    if not coll then return nil end
+    local BookList = require("ui/widget/booklist")
+    local coll_settings = ReadCollection.coll_settings[coll_name] or {}
+    local collate = coll_settings.collate and BookList.collates[coll_settings.collate]
+    local items = {}
+    for _, item in pairs(coll) do
+        local tmp = { file = item.file, text = item.text, order = item.order, attr = item.attr }
+        if collate and collate.item_func then collate.item_func(tmp, ui) end
+        table.insert(items, tmp)
+    end
+    local sorting_func
+    if collate then
+        sorting_func = collate.init_sort_func()
+        if coll_settings.collate_reverse then
+            local unreversed = sorting_func
+            sorting_func = function(a, b) return unreversed(b, a) end
+        end
+    else
+        sorting_func = function(a, b) return a.order < b.order end
+    end
+    table.sort(items, sorting_func)
+    local files = {}
+    for i, item in ipairs(items) do files[i] = item.file end
+    return files
+end
+
+-- Next (or previous) unfinished, openable file after curr_file in the collection.
+-- Returns false if curr_file is not in it, nil if there is no such file.
+local function getNextOrPreviousFileInCollection(coll_name, curr_file, prev, ui)
+    local files = getCollectionFiles(coll_name, ui)
+    if not files then return false end
+    local idx
+    for i, file in ipairs(files) do
+        if file == curr_file then idx = i break end
+    end
+    if not idx then return false end
+    local BookList = require("ui/widget/booklist")
+    local DocumentRegistry = require("document/documentregistry")
+    local step = prev and -1 or 1
+    local i = idx + step
+    while files[i] do
+        local file = files[i]
+        if lfs.attributes(file, "mode") == "file" and DocumentRegistry:hasProvider(file)
+                and BookList.getBookStatus(file) ~= "complete" then
+            return file
+        end
+        i = i + step
+    end
+    return nil
+end
+
+local function inCollectionContext(file)
+    return coll_context.file ~= nil and coll_context.file == file
+        and ReadCollection.coll[coll_context.coll] ~= nil
+        and ReadCollection.coll[coll_context.coll][file] ~= nil
+end
+
+local function patchCollectionNavigation()
+    local FileManagerCollection = require("apps/filemanager/filemanagercollection")
+    local ReaderStatus = require("apps/reader/modules/readerstatus")
+    if rawget(ReaderStatus, PATCH_MARK) then return end
+
+    -- `self` is the BookList here, whose path is the collection name.
+    local orig_select = FileManagerCollection.onMenuSelect
+    FileManagerCollection.onMenuSelect = function(self, item, ...)
+        local coll_settings = ReadCollection.coll_settings[self.path]
+        local is_search = coll_settings and coll_settings.find_results
+        if not (self._manager and self._manager.selected_files) and not is_search then
+            coll_context.file, coll_context.coll = item.file, self.path
+        end
+        return orig_select(self, item, ...)
+    end
+
+    local orig_next = ReaderStatus.onOpenNextOrPreviousFileInFolder
+    ReaderStatus.onOpenNextOrPreviousFileInFolder = function(self, prev, ...)
+        local curr_file = self.document and self.document.file
+        if not inCollectionContext(curr_file) then
+            return orig_next(self, prev, ...)
+        end
+        local coll_name = coll_context.coll
+        local file = getNextOrPreviousFileInCollection(coll_name, curr_file, prev, self.ui)
+        if file then
+            coll_context.file = file
+            local filemanagerutil = require("apps/filemanager/filemanagerutil")
+            -- Delayed for the same reason as in ReaderStatus: this destroys the Document.
+            UIManager:nextTick(function()
+                filemanagerutil.openFile(self.ui, file)
+            end)
+        else
+            local FMColl = require("apps/filemanager/filemanagercollection")
+            local title = FMColl.getCollectionTitle and FMColl:getCollectionTitle(coll_name) or coll_name
+            UIManager:show(InfoMessage:new{
+                text = prev and T(_("This is the first unread file in collection %1."), title)
+                             or T(_("This is the last unread file in collection %1."), title),
+            })
+        end
+        return true
+    end
+
+    -- Core disables "next file" when the file browser sorts by date/access; that
+    -- restriction is about folders and does not apply to a collection.
+    local orig_end = ReaderStatus.onEndOfBook
+    ReaderStatus.onEndOfBook = function(self, ...)
+        local collate = G_reader_settings:readSetting("collate")
+        if G_reader_settings:readSetting("end_document_action") == "next_file"
+                and (collate == "access" or collate == "date")
+                and inCollectionContext(self.document and self.document.file) then
+            if G_reader_settings:isTrue("end_document_auto_mark") then
+                self:markBook(true)
+            end
+            return self:onOpenNextOrPreviousFileInFolder()
+        end
+        return orig_end(self, ...)
+    end
+
+    rawset(ReaderStatus, PATCH_MARK, true)
+end
+
+local ok_nav, err_nav = pcall(patchCollectionNavigation)
+if not ok_nav then
+    logger.warn("wallabagtags: could not patch collection navigation:", err_nav)
+end
+
 -- Best-effort early patch: succeeds when both plugins live in plugins/, because
 -- "plugins/wallabag.koplugin" sorts before "plugins/wallabagtags.koplugin" and the
 -- stock class is therefore already in enabled_plugins. init() retries otherwise.
@@ -765,6 +898,9 @@ WallabagTags._testing = {
     removeAllManaged = removeAllManaged,
     rePrefix = rePrefix,
     UNTAGGED_LABEL = UNTAGGED_LABEL,
+    coll_context = coll_context,
+    getCollectionFiles = getCollectionFiles,
+    getNextOrPreviousFileInCollection = getNextOrPreviousFileInCollection,
 }
 
 return WallabagTags

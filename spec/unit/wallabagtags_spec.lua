@@ -547,4 +547,81 @@ describe("Wallabag tag collections plugin", function()
             assert.equals("sentinel", ret) -- the user's sync still completed
         end)
     end)
+    describe("next file within a collection", function()
+        local ReaderStatus, statuses
+        local orig_status
+
+        local function makeColl(name, files)
+            ReadCollection.coll[name] = {}
+            ReadCollection.coll_settings[name] = { order = 2 }
+            for _, f in ipairs(files) do ReadCollection:addItem(f, name) end
+        end
+
+        before_each(function()
+            ReaderStatus = require("apps/reader/modules/readerstatus")
+            local BookList = require("ui/widget/booklist")
+            statuses = {}
+            orig_status = BookList.getBookStatus
+            BookList.getBookStatus = function(file) return statuses[file] or "new" end
+            tt.coll_context.file, tt.coll_context.coll = nil, nil
+        end)
+
+        after_each(function()
+            require("ui/widget/booklist").getBookStatus = orig_status
+        end)
+
+        it("follows the manual order of the collection", function()
+            local a, b, c = makeArticle(1, "C"), makeArticle(2, "A"), makeArticle(3, "B")
+            makeColl("wb: x", { a, b, c })
+            assert.same({ a, b, c }, tt.getCollectionFiles("wb: x"))
+            assert.equals(b, tt.getNextOrPreviousFileInCollection("wb: x", a))
+            assert.equals(b, tt.getNextOrPreviousFileInCollection("wb: x", c, true))
+            assert.is_nil(tt.getNextOrPreviousFileInCollection("wb: x", c))
+            assert.is_false(tt.getNextOrPreviousFileInCollection("wb: x", "/nope.epub"))
+        end)
+
+        it("honours the collection's own sort and reverse", function()
+            -- Name sorting sees the whole filename, so the ids drive the order.
+            local a, b, c = makeArticle(3), makeArticle(1), makeArticle(2)
+            makeColl("wb: x", { a, b, c })
+            ReadCollection.coll_settings["wb: x"].collate = "strcoll"
+            assert.same({ b, c, a }, tt.getCollectionFiles("wb: x"))
+            ReadCollection.coll_settings["wb: x"].collate_reverse = true
+            assert.same({ a, c, b }, tt.getCollectionFiles("wb: x"))
+        end)
+
+        it("skips finished and missing files", function()
+            local a, b, c, d = makeArticle(1), makeArticle(2), makeArticle(3), makeArticle(4)
+            makeColl("wb: x", { a, b, c, d })
+            statuses[b] = "complete"
+            os.remove(c)
+            assert.equals(d, tt.getNextOrPreviousFileInCollection("wb: x", a))
+        end)
+
+        it("advances the context and falls back to the folder outside it", function()
+            local a, b = makeArticle(1), makeArticle(2)
+            makeColl("wb: x", { a, b })
+            local UIManager = require("ui/uimanager")
+            local orig_tick = UIManager.nextTick
+            UIManager.nextTick = function() end
+            local fake = { document = { file = a }, ui = {} }
+
+            tt.coll_context.file, tt.coll_context.coll = a, "wb: x"
+            assert.is_true(ReaderStatus.onOpenNextOrPreviousFileInFolder(fake))
+            assert.equals(b, tt.coll_context.file)
+
+            -- Opened from elsewhere: the original folder walk runs.
+            tt.coll_context.file = "/elsewhere.epub"
+            local FileChooser = require("ui/widget/filechooser")
+            local orig_new = FileChooser.new
+            local called = false
+            FileChooser.new = function()
+                return { getNextOrPreviousFileInFolder = function() called = true return b end }
+            end
+            ReaderStatus.onOpenNextOrPreviousFileInFolder(fake)
+            FileChooser.new = orig_new
+            UIManager.nextTick = orig_tick
+            assert.is_true(called)
+        end)
+    end)
 end)
